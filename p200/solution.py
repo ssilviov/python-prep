@@ -11,13 +11,13 @@ class Solution:
     def validate_get_size(self, grid: list[list[str]]) -> tuple[int, int]:
         n = len(grid)
         if n == 0:
-            return "Empty grid."
+            raise ValueError("Empty grid.")
 
         m = len(grid[0])
         if m == 0:
-            return "Grid with empty rows."
+            raise ValueError("Grid with empty rows.")
         if any(len(x) != m for x in grid):
-            return "Grid has different lengths for rows."
+            raise ValueError("Grid has different lengths for rows.")
 
         return n, m
 
