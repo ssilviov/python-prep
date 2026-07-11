@@ -1,1 +1,1 @@
-# python-prep
+A collection of solution to some leetcode problems in python.
