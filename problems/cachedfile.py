@@ -1,5 +1,6 @@
 import collections
 import threading
+import enum
 
 class StorageClient:
 
@@ -14,32 +15,31 @@ class StorageClient:
         for i in range(size):
             buffer[i] = i % 256
 
+class BlockStatus(enum.Enum):
+    EMPTY = 0
+    PENDING = 1
+    READY = 2
+    ERROR = 3
+
+
 class CacheBlock:
 
     BLOCK_SIZE = 1024 # just for our exercise let's do 1kb
 
-    def __init__(self):
-        self.size = 0
-        self.buffer = bytearray(self.BLOCK_SIZE)
+    def __init__(self, physical_index):
+        self.valid_bytes = 0
+        self.buffer = bytearray(CacheBlock.BLOCK_SIZE)
         self.block_num = -1
-
-    def reset(self):
-        self.size = 0
-
-    def read(self, client: StorageClient, block_num: int):
-        offset = block_num * self.BLOCK_SIZE
-        bytes_to_read = min(self.BLOCK_SIZE, client.get_size() - offset)
-        client.readBlock(offset, bytes_to_read, self.buffer)
-        self.size = bytes_to_read
-        self.block_num = block_num
+        self.physical_idx = physical_index
+        self.logical_idx = -1
+        self.lock = threading.Lock()
+        self.cond = threading.Condition(self.lock)
+        self.reader_count = 0
+        self.status = BlockStatus.EMPTY
 
 
 class CachedFile:
     
-    EMPTY = 0
-    PENDING = 1
-    READY = 2
-
     def __init__(self, client: StorageClient, max_cache_size: int):
         self.client = client
         self.max_cache_size = max_cache_size
@@ -51,19 +51,12 @@ class CachedFile:
                 ' multiple of {self.BLOCK_SIZE}')
         self.blocks_num = max_cache_size // CacheBlock.BLOCK_SIZE
 
-        self.cache = [CacheBlock() for i in range(self.blocks_num)]
+        self.cache = [CacheBlock(i) for i in range(self.blocks_num)]
         self.lock = threading.Lock()
         self.block_map = collections.OrderedDict()
+        self.free_slots = list(range(self.blocks_num))
 
-        self.block_lock = [threading.Lock() for i in range(self.blocks_num)]
-        self.block_cond = [threading.Condition(l) for l in self.block_lock]
-        self.block_status = [self.EMPTY for i in range.blocks_num]
-        self.reader_counts = [0] * range.blocks_num
-
-        self.free_slots = [i for i in range(self.blocks_num)]
-
-    def _find_idx_and_pin(self, block_num: int) -> tuple(int, bool):
-        idx = -1
+    def get_block_and_pin(self, block_num: int) -> tuple[int, bool]:
 
         with self.lock:
 
@@ -72,50 +65,42 @@ class CachedFile:
                 self.block_map.move_to_end(block_num, last=True)
 
                 idx = self.block_map[block_num]
-                self.reader_counts[idx] += 1 # pin
+                block = self.cache[idx]
+                with block.lock:
+                    block.reader_count += 1 # pin
                 return idx, False # already being fetched.
 
+            idx = -1
             # Find a new block
             if len(self.block_map) == self.blocks_num:
                 # no empty slots.
-                key = -1
+                key_to_evict = -1
                 for key, old_idx in self.block_map.items():
-                    if self.reader_counts[cache_idx] == 0:
-                        idx = old_idx
-                        key = block_idx
-                        break
-                if key == -1:
+                    block = self.cache[old_idx]
+                    with block.lock:
+                        if block.reader_count == 0:
+                            key_to_evict = key
+                            idx = old_idx
+                            break
+                if key_to_evict == -1:
                     raise RuntimeError("All slots are being read.")
-                self.block_map.pop(key)
+                self.block_map.pop(key_to_evict)
             else:
                 idx = self.free_slots.pop()
-            self.reader_counts[idx] = 1
+
+            block = self.cache[idx]
+            with block.lock:
+                block.reader_count = 1
+                block.status = BlockStatus.PENDING
+                block.valid_bytes = 0
             self.block_map[block_num] = idx
-            with self.block_lock[idx]:
-                self.block_status[idx] = self.PENDING
+            
             return idx, True
-
-    def get_block(self, block_num: int) -> tuple[CacheBlock, int]:
-        idx, need_fetch = self._find_idx_and_pin(block_num)
-
-        if not need_fetch:
-            with self.block_lock[idx]:
-                while self.block_status != self.READY:
-                    self.block_cond[idx].wait()
-            return self.cache[idx], idx
-
-        block = self.cache[idx]
-        block.read(self.client, block_num)
-        with self.block_lock[idx]:
-            self.block_status[idx] = self.READY
-            self.block_cond[idx].notify_all()
-
-        return block, idx
 
     def read(self, offset: int, size: int, buffer: bytearray) -> int:
 
+        # validate input, that size and offset are valid.
         file_size = self.client.get_size()
-
         if size == 0 or offset == file_size:
             return 0
 
@@ -134,19 +119,57 @@ class CachedFile:
             block_idx = current_offset // CacheBlock.BLOCK_SIZE
             block_offset = current_offset % CacheBlock.BLOCK_SIZE
 
-            block, idx = self.get_block(block_idx)
+            idx, needs_fetch = self.get_block_and_pin(block_idx)
+            block = self.cache[idx]
 
-            bytes_to_read = min(block.size - block_offset, bytes_left)
-            if bytes_to_read <= 0:
-                break
-            
             try:
+                if needs_fetch:
+                    offset_in_file = block_idx * CacheBlock.BLOCK_SIZE
+                    fetch_bytes = min(file_size - offset_in_file, CacheBlock.BLOCK_SIZE)
+                    try:
+                        self.client.readBlock(offset_in_file, fetch_bytes, block.buffer)
+
+                        with block.lock:
+                            block.valid_bytes = fetch_bytes
+                            block.status = BlockStatus.READY
+                            block.cond.notify_all()
+
+                    except Exception as e:
+                        with block.lock:
+                            block.valid_bytes = 0
+                            block.status = BlockStatus.ERROR
+                            block.cond.notify_all()
+
+                        with self.lock:
+                            if block_idx in self.block_map and self.block_map[block_idx] == idx:
+                                self.block_map.pop(block_idx)
+                                self.free_slots.append(block_idx)
+                        raise IOError(f"Failed fetch of block {block_idx}") from e
+
+                else:
+                    with block.lock:
+                        while block.status == BlockStatus.PENDING:
+                            block.cond.wait()
+
+                        if block.status == BlockStatus.ERROR:
+                            raise IOError(f"Failed fetch of block {block_idx}")
+                        
+
+                bytes_to_read = min(block.valid_bytes - block_offset, bytes_left)
+                if bytes_to_read <= 0:
+                    break
+
                 buffer[buffer_idx : buffer_idx + bytes_to_read] = (
                     block.buffer[block_offset : block_offset + bytes_to_read])
 
-            finally:
                 with self.lock:
-                    self.reader_counts[idx] -= 1
+                    if block_idx in self.block_map:
+                        self.block_map.move_to_end(block_idx)
+            finally:
+                # always unpin
+                with block.lock:
+                    block.reader_count -= 1
+
             buffer_idx += bytes_to_read
             bytes_left -= bytes_to_read
             current_offset += bytes_to_read
